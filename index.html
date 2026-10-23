@@ -109,9 +109,9 @@ h3{font-weight:600;font-size:15.5px;margin:0;letter-spacing:-.004em;line-height:
 
 /* controles */
 input,button,select{font:inherit;color:inherit}
-input[type=text],select{background:var(--surface);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:9px 11px;width:100%;min-width:0;font-size:16px;height:42px;transition:border-color .15s,box-shadow .15s}
-input[type=text]:hover,select:hover{border-color:var(--muted)}
-input[type=text]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+input[type=text],input[type=password],select{background:var(--surface);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:9px 11px;width:100%;min-width:0;font-size:16px;height:42px;transition:border-color .15s,box-shadow .15s}
+input[type=text]:hover,input[type=password]:hover,select:hover{border-color:var(--muted)}
+input[type=text]:focus,input[type=password]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 input.n{font-variant-numeric:tabular-nums;text-align:right;font-weight:500}
 input:focus-visible,button:focus-visible,select:focus-visible,summary:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 button{cursor:pointer;border:1px solid var(--line-2);background:var(--surface);border-radius:var(--r-sm);padding:0 14px;height:40px;font-weight:600;font-size:14px;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:background .15s,border-color .15s,color .15s}
@@ -320,6 +320,8 @@ ol.steps{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px;f
 .top-r{display:flex;align-items:center;gap:8px}
 .theme-btn{width:38px;height:38px;padding:0;border-radius:50%;background:var(--surface);border:1px solid var(--line);color:var(--ink-2)}
 .theme-btn svg{width:18px;height:18px}
+.auth{display:flex;flex-direction:column;gap:12px}
+.sync{cursor:pointer}
 </style>
 
 <div class="app">
@@ -347,6 +349,7 @@ ol.steps{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px;f
 </div>
 <div class="toast" id="toast" role="status" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 (function(){
 "use strict";
@@ -411,18 +414,66 @@ function migrate(o){
 function loadLocal(){try{return migrate(JSON.parse(localStorage.getItem(LKEY)))}catch(e){return null}}
 function saveLocal(){try{localStorage.setItem(LKEY,JSON.stringify(S))}catch(e){}}
 
-/* ============ sincronização na conta (db) ============ */
+/* ============ contas e sincronização ============ */
+/* Supabase: preenchido na versão publicada (GitHub Pages). Vazio = usa o armazenamento do Claude ou só o aparelho. */
+const SB_URL='https://vrocmywpzdmrgejonadh.supabase.co',SB_KEY='sb_publishable_c5cJEU_RE2p22jhMaS47EA_B86W6fVe';
+const SB_ON=!!(SB_URL&&SB_KEY&&!SB_URL.startsWith('__')&&window.supabase&&window.supabase.createClient);
+let sb=null,sbUser=null,sbChan=null,pendingRemote=null,recovery=false,authMsg='',authBusy=false;
 let ref=null,cloudOK=false,saveT=null,saving=false,pending=false,acct={state:'checking',name:''};
+const OKEY='meucr.owner';
 function setSync(kind,txt){const el=$('#sync');el.className='sync '+kind;$('#syncTxt').textContent=txt}
 function touch(){if(!S)return;S.updatedAt=Date.now();saveLocal();
-  if(cloudOK){setSync('saving','Salvando…');clearTimeout(saveT);saveT=setTimeout(pushCloud,700)}else setSync('local','Salvo neste aparelho')}
-async function pushCloud(){if(!ref||!S)return;if(saving){pending=true;return}saving=true;
-  try{await ref.set({json:JSON.stringify(S),updatedAt:S.updatedAt});setSync('cloud','Sincronizado')}
-  catch(e){cloudOK=false;acct.state='noWrite';setSync('local','Salvo neste aparelho')}
-  saving=false;if(pending){pending=false;pushCloud()}}
-async function pullCloud(){if(!ref)return;
-  try{const snap=await ref.get();if(!snap.exists)return null;const d=snap.data();return{st:migrate(JSON.parse(d.json)),at:d.updatedAt||0}}catch(e){return null}}
+  if(cloudOK){setSync('saving','Salvando…');clearTimeout(saveT);saveT=setTimeout(pushCloud,600)}else setSync('local','Salvo neste aparelho')}
+async function pushCloud(){if(!S)return;if(saving){pending=true;return}saving=true;
+  try{
+    if(sbUser){const {error}=await sb.from('paineis').upsert({user_id:sbUser.id,dados:S,updated_at:new Date(S.updatedAt||Date.now()).toISOString()});if(error)throw error;try{localStorage.setItem(OKEY,sbUser.id)}catch(_){}}
+    else if(ref){await ref.set({json:JSON.stringify(S),updatedAt:S.updatedAt})}
+    else return;
+    setSync('cloud','Sincronizado');
+  }catch(e){setSync('local','Sem conexão · salvo neste aparelho');if(ref&&!sbUser){cloudOK=false;acct.state='noWrite'}}
+  finally{saving=false;if(pending){pending=false;pushCloud()}}}
+async function pullCloud(){
+  try{
+    if(sbUser){const {data,error}=await sb.from('paineis').select('dados,updated_at').eq('user_id',sbUser.id).maybeSingle();if(error||!data)return null;const st=migrate(data.dados);return st?{st,at:st.updatedAt||Date.parse(data.updated_at)||0}:null}
+    if(ref){const snap=await ref.get();if(!snap.exists)return null;const d=snap.data();return{st:migrate(JSON.parse(d.json)),at:d.updatedAt||0}}
+  }catch(e){}return null}
+function applyRemote(st){const ae=document.activeElement;if(ae&&ae.matches('input,textarea,select')&&$('#view').contains(ae)){pendingRemote=st;return}
+  pendingRemote=null;S=st;saveLocal();render();toast('Atualizado com as alterações de outro aparelho.')}
+document.addEventListener('focusout',()=>setTimeout(()=>{if(pendingRemote&&!(document.activeElement&&document.activeElement.matches('input,textarea,select'))){const st=pendingRemote;if((st.updatedAt||0)>(S?.updatedAt||0))applyRemote(st);else pendingRemote=null}},250));
+
+async function sbLogin(user){
+  if(sbUser&&sbUser.id===user.id&&cloudOK)return;
+  sbUser=user;acct.name=user.email||'';acct.state='cloud';
+  let owner=null;try{owner=localStorage.getItem(OKEY)}catch(_){}
+  const r=await pullCloud();
+  if(r&&r.st){
+    if(!S||owner===user.id){if(!S||r.at>=(S.updatedAt||0)){S=r.st;saveLocal()}else{cloudOK=true;await pushCloud()}}
+    else if(JSON.stringify(r.st)!==JSON.stringify(S)){acct.state='conflict';acct.remote=r.st;cloudOK=false;setSync('local','Escolha quais dados manter');tab='ajustes';render();return}
+  }else if(S){cloudOK=true;await pushCloud()}
+  try{localStorage.setItem(OKEY,user.id)}catch(_){}
+  cloudOK=true;setSync('cloud','Sincronizado');
+  if(sbChan)sb.removeChannel(sbChan);
+  sbChan=sb.channel('painel-'+user.id).on('postgres_changes',{event:'*',schema:'public',table:'paineis',filter:'user_id=eq.'+user.id},pl=>{
+    const d=pl.new&&pl.new.dados;if(!d)return;const st=migrate(d);if(st&&(st.updatedAt||0)>(S?.updatedAt||0))applyRemote(st)}).subscribe();
+  render();
+}
+function sbLogout(){if(sbChan){sb.removeChannel(sbChan);sbChan=null}sbUser=null;cloudOK=false;acct={state:'signedOut',name:''};
+  S=null;try{localStorage.removeItem(LKEY);localStorage.removeItem(OKEY)}catch(_){}setupCurso=null;setupLogin=false;tab='painel';setSync('local','Salvo neste aparelho');render()}
 async function initCloud(){
+  if(SB_ON){
+    try{
+      sb=window.supabase.createClient(SB_URL,SB_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+      sb.auth.onAuthStateChange((ev,ses)=>{
+        if(ev==='PASSWORD_RECOVERY'){recovery=true;if(ses&&ses.user){sbUser=ses.user;acct.name=ses.user.email||''}tab='ajustes';render();return}
+        if(ev==='SIGNED_OUT'){if(sbUser)sbLogout();return}
+        if(ses&&ses.user&&(!sbUser||sbUser.id!==ses.user.id||!cloudOK)&&acct.state!=='conflict')setTimeout(()=>sbLogin(ses.user),0);
+      });
+      const {data}=await sb.auth.getSession();
+      if(data&&data.session&&data.session.user)await sbLogin(data.session.user);
+      else{acct.state='signedOut';setSync('local','Salvo neste aparelho');refresh()}
+    }catch(e){acct.state='signedOut';setSync('local','Salvo neste aparelho');refresh()}
+    return;
+  }
   try{
     const noAcct=st=>{acct.state=st;setSync('local','Salvo neste aparelho');refresh()};
     if(!window.claude||!window.claude.use)return noAcct('none');
@@ -441,8 +492,40 @@ async function initCloud(){
 document.addEventListener('visibilitychange',async()=>{
   if(document.visibilityState!=='visible'||!cloudOK||saving||pending)return;
   const r=await pullCloud();
-  if(r&&r.st&&r.at>(S?.updatedAt||0)){const ae=document.activeElement;if(ae&&ae.matches('input,textarea'))return;S=r.st;saveLocal();render();toast('Dados atualizados com as alterações feitas em outro aparelho.')}
+  if(r&&r.st&&r.at>(S?.updatedAt||0))applyRemote(r.st);
 });
+function authErr(e){const m=String(e&&e.message||e);
+  if(/Invalid login/i.test(m))return'E-mail ou senha incorretos.';
+  if(/not confirmed/i.test(m))return'Confirme seu e-mail pelo link que enviamos antes de entrar.';
+  if(/already registered|already been registered/i.test(m))return'Já existe uma conta com este e-mail. Use Entrar.';
+  if(/Password should be|at least 6/i.test(m))return'A senha precisa ter pelo menos 6 caracteres.';
+  if(/rate limit|security purposes/i.test(m))return'Muitas tentativas seguidas. Aguarde alguns minutos e tente de novo.';
+  if(/valid email|invalid format/i.test(m))return'Digite um e-mail válido.';
+  return'Não foi possível concluir agora. Verifique a conexão e tente de novo.'}
+const redirectTo=()=>location.origin+location.pathname;
+async function authAction(kind){
+  const email=($('#authEmail')?.value||'').trim(),pass=$('#authPass')?.value||'';
+  if(authBusy)return;authBusy=true;authMsg='';
+  try{
+    if(kind==='in'){if(!email||!pass)throw{message:'invalid format'};const {error}=await sb.auth.signInWithPassword({email,password:pass});if(error)throw error;authMsg=''}
+    else if(kind==='up'){if(!email)throw{message:'invalid format'};if(pass.length<6)throw{message:'at least 6'};
+      const {data,error}=await sb.auth.signUp({email,password:pass,options:{emailRedirectTo:redirectTo()}});if(error)throw error;
+      if(data&&data.user&&data.user.identities&&data.user.identities.length===0)throw{message:'already registered'};
+      authMsg=data&&data.session?'':'ok:Conta criada. Enviamos um link de confirmação para '+email+'. Depois de confirmar, volte e toque em Entrar.'}
+    else if(kind==='reset'){if(!email)throw{message:'invalid format'};const {error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:redirectTo()});if(error)throw error;authMsg='ok:Enviamos um link para '+email+' para você criar uma nova senha.'}
+    else if(kind==='newpass'){const np=$('#authNewPass')?.value||'';if(np.length<6)throw{message:'at least 6'};const {error}=await sb.auth.updateUser({password:np});if(error)throw error;recovery=false;authMsg='ok:Senha atualizada.';if(sbUser)setTimeout(()=>sbLogin(sbUser),0)}
+    else if(kind==='out'){await sb.auth.signOut();sbLogout();toast('Você saiu da conta. Os dados continuam salvos nela.')}
+  }catch(e){authMsg='err:'+authErr(e)}
+  authBusy=false;render();
+}
+function authFormHTML(){
+  const msg=authMsg?`<div class="alert ${authMsg.startsWith('ok:')?'info':'bad'}">${authMsg.startsWith('ok:')?IC.info:'<span class="b">'+IC.alert+'</span>'}<div>${esc(authMsg.slice(authMsg.indexOf(':')+1))}</div></div>`:'';
+  return`<div class="auth">
+    <div class="field"><label for="authEmail">E-mail</label><input type="text" id="authEmail" inputmode="email" autocomplete="email" autocapitalize="off" spellcheck="false" placeholder="voce@email.com"></div>
+    <div class="field"><label for="authPass">Senha</label><input type="password" id="authPass" autocomplete="current-password" placeholder="Mínimo de 6 caracteres"></div>
+    ${msg}
+    <div class="row"><button class="primary" data-act="auth-in">Entrar</button><button data-act="auth-up">Criar conta</button><span style="flex:1"></span><button class="ghost" data-act="auth-reset">Esqueci minha senha</button></div>
+  </div>`}
 
 /* ============ cálculos ============ */
 function prevEff(p){if(p.disc&&p.disc.length){let s=0,c=0;p.disc.forEach(d=>{s+=num(d.nota)*num(d.cred);c+=num(d.cred)});return{cr:c?s/c:0,cred:c,s}}const c=num(p.cred);return{cr:num(p.cr),cred:c,s:num(p.cr)*c}}
@@ -460,6 +543,13 @@ function calc(){
 }
 function contaHTML(){
   const a=acct.state;const who=acct.name?esc(acct.name):'';
+  if(SB_ON){
+    if(recovery)return`<div class="alert info">${IC.info}<div><strong>Crie uma nova senha</strong> para ${who||'sua conta'}.</div></div><div class="field"><label for="authNewPass">Nova senha</label><input type="password" id="authNewPass" autocomplete="new-password" placeholder="Mínimo de 6 caracteres"></div><div class="row"><button class="primary" data-act="auth-newpass">Salvar nova senha</button></div>`;
+    if(a==='conflict')return`<div class="alert warn"><span class="w">${IC.alert}</span><div><strong>Sua conta já tem um painel salvo.</strong> Este aparelho também tem dados diferentes. Escolha qual manter; o outro será substituído.</div></div><div class="row"><button class="primary" data-act="keep-remote">Usar os dados da conta</button><button data-act="keep-local">Usar os dados deste aparelho</button></div>`;
+    if(a==='cloud'&&sbUser){const m=authMsg.startsWith('ok:')?`<div class="alert info">${IC.info}<div>${esc(authMsg.slice(3))}</div></div>`:'';return`<div class="alert info">${IC.info}<div><strong>Conectado como ${who}.</strong> Tudo é salvo na sua conta e sincronizado em tempo real entre os aparelhos em que você entrar.</div></div>${m}<div class="row"><button data-act="auth-out">Sair da conta</button></div>`}
+    if(a==='checking')return`<p class="note">Verificando a conta…</p>`;
+    return`<p class="note">Entre ou crie uma conta com seu e-mail para salvar o painel na nuvem e usar o mesmo progresso no celular e no computador ao mesmo tempo.</p>${authFormHTML()}`;
+  }
   if(a==='cloud')return`<div class="alert info">${IC.info}<div><strong>Sincronização ativa${who?' · '+who:''}.</strong> Suas alterações são salvas automaticamente na sua conta e ficam disponíveis em qualquer aparelho conectado a ela.</div></div>`;
   if(a==='checking')return`<p class="note">Verificando a conta…</p>`;
   return`<div class="alert">${IC.lock.replace('<svg','<svg class="ic" fill="none" stroke="currentColor" stroke-width="2"')}<div><strong>Salvo neste aparelho${who?' · '+who:''}.</strong> Seu painel é privado e é salvo automaticamente neste navegador. Para usar em outro aparelho, exporte um backup e importe-o lá.</div></div>${lastBk()}`;
@@ -811,7 +901,7 @@ function viewAjustes(){
 }
 
 /* ----- Configuração inicial ----- */
-let setupP=1,setupCurso=null,setupEnf='',setupQ='';
+let setupP=1,setupCurso=null,setupEnf='',setupQ='',setupLogin=false;
 function courseListHTML(q,act){
   const t=deaccent(q.trim());const groups={};
   CURSOS.filter(c=>!t||deaccent(c.n).includes(t)).forEach(c=>{(groups[c.c]=groups[c.c]||[]).push(c)});
@@ -836,7 +926,8 @@ function viewSetup(){
     </div>
     <div class="search">${IC.search}<input type="text" id="cSearch" placeholder="Buscar curso, por exemplo: direito, engenharia, psicologia" value="${esc(setupQ)}" aria-label="Buscar curso" autocomplete="off"></div>
     <div id="cList" class="cwrap">${courseListHTML(setupQ,'pick-setup')}</div>
-    <div class="row"><button class="ghost" data-act="bk-imp">Restaurar a partir de um backup</button></div>
+    <div class="row">${SB_ON?'<button data-act="show-login">Já tenho conta · Entrar</button>':''}<button class="ghost" data-act="bk-imp">Restaurar a partir de um backup</button></div>
+    ${SB_ON&&setupLogin?`<div class="card" style="box-shadow:none">${acct.state==='cloud'&&sbUser?'<p class="note">Conectado. Carregando seu painel…</p>':authFormHTML()}</div>`:''}
     ${impBoxHTML()}
   </section>${footerHTML()}`;
   const plan=setupCurso!=='outro'?planFor(setupCurso,setupEnf):null;const c=plan&&plan.course;
@@ -913,6 +1004,14 @@ $('#view').addEventListener('click',async e=>{
     const pl=curPlan();p.disc=(pl&&pl.per[n])?discFrom(pl,n,nota).map(({fixa,...d})=>d):[{id:uid(),cod:'',nome:'Disciplina 1',cred:num(p.cred)||4,nota}];
     touch();openPer=i;render();reopen();toast('Grade carregada com a média do período. Substitua pelas notas oficiais.');break}
   case'undetail':{const i=+b.dataset.i,p=S.prev[i];const e=prevEff(p);p.cr=Math.round(e.cr*100)/100;p.cred=e.cred;delete p.disc;touch();openPer=i;render();reopen();break}
+  case'auth-in':authAction('in');break;
+  case'auth-up':authAction('up');break;
+  case'auth-reset':authAction('reset');break;
+  case'auth-newpass':authAction('newpass');break;
+  case'auth-out':authAction('out');break;
+  case'show-login':setupLogin=!setupLogin;render();break;
+  case'keep-remote':S=acct.remote;saveLocal();acct.state='cloud';acct.remote=null;sbUser&&(cloudOK=false,sbLogin(sbUser));break;
+  case'keep-local':acct.state='cloud';acct.remote=null;cloudOK=true;try{localStorage.setItem(OKEY,sbUser.id)}catch(_){};S.updatedAt=Date.now();pushCloud().then(()=>{if(sbUser){cloudOK=false;sbLogin(sbUser)}});break;
   case'theme':setTheme(b.dataset.v);render();break;
   case'retake':{const row=b.closest('[data-scope]');const [,pi]=row.dataset.scope.split(':');const d=S.prev[+pi].disc[+row.dataset.i];
     const nd={id:uid(),cod:d.cod,nome:d.nome.replace(/ \(refazer\)$/,'')+' (refazer)',cred:num(d.cred),nota:7,fixa:false};
@@ -973,6 +1072,7 @@ function applyTheme(){const el=document.documentElement;
   if(themePref==='auto'){if(viewerTheme)el.setAttribute('data-theme',viewerTheme);else el.removeAttribute('data-theme')}else el.setAttribute('data-theme',themePref);
   const b=$('#themeBtn');if(b)b.innerHTML=isDark()?SUN:MOON;if(S&&tab==='painel')drawChart()}
 function setTheme(v){themePref=v;try{localStorage.setItem(TKEY,v)}catch(_){};applyTheme()}
+$('#sync').addEventListener('click',()=>{if(S){tab='ajustes';render();window.scrollTo(0,0)}});
 $('#themeBtn').addEventListener('click',()=>{setTheme(isDark()?'light':'dark');if(S&&tab==='ajustes')render()});
 try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme)}catch(_){}
 applyTheme();
